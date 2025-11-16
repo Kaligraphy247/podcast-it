@@ -339,10 +339,10 @@ class Action:
             result["style"] = "\n".join(style_lines)
         else:
             result["warning"] = (
-                "No style instructions found. Consider adding tone/style guidance before speaker lines to set the tone of the conversation"
+                "No style instructions found. Using default style from settings. Consider adding tone/style guidance before speaker lines to customize the tone of the conversation"
             )
 
-            result["has_style"] = True
+            result["has_style"] = False  # No user-provided style, using default
             # use the default/custom self.valves.custom_style_instructions
             result["style"] = self.valves.custom_style_instructions
 
