@@ -41,7 +41,7 @@ Transform text conversations into engaging multi-speaker podcasts with AI-genera
 3. **Install dependencies**:
    The plugin requires the `google-genai` package, which is specified in the plugin metadata and will be installed automatically by Open WebUI.
    
-   > You might not need this, `google-genai` might already be installed in you development or deployment environment (even in docker images)
+   > You might not need this, `google-genai` might already be installed in you development or deployment environment (including in docker images)
 
 ## Usage
 
@@ -74,7 +74,7 @@ Transform text conversations into engaging multi-speaker podcasts with AI-genera
    - Wait for generation to complete
    - Play the audio directly in the embedded player or download it
 
-   > While not necessary, try to have one podcast per chat, it reduces the tokens used to generate the transcript by not sending older (or probably unrelated) transcripts/conversations. However, if you are iterating on the transcript, this fine; only the last message (that is a valid transcript) is used to generate the podcast.
+   > While not necessary, try to have one podcast per chat, it reduces the tokens used to generate transcripts by not including older (or probably unrelated) transcripts/conversations in your messages array. However, if you are iterating on the transcript, this fine; only the last message (that is a valid transcript) is used to generate the podcast.
 
 ### Transcript Format Rules
 
@@ -149,7 +149,7 @@ The plugin uses Open WebUI's event emitter system:
 
 ### Citation Rendering
 
-Audio files are displayed using an embedded HTML player with:
+Audio files are displayed in the citations (Sources) UI modal using an embedded HTML player with:
 - Native `<audio>` controls
 - Dark mode support (automatic theme detection)
 - Download link in header
