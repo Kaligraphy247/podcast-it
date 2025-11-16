@@ -214,29 +214,38 @@ class Action:
         )
 
     def __init__(self) -> None:
+        """Initialize the Action class with default Valves configuration."""
         self.valves = self.Valves()
 
     def _validate_transcript_format(self, text: str) -> dict:
         """
         Validate and parse transcript format with detailed feedback.
 
+        Parses the transcript to ensure it follows the required format for podcast generation.
+        Validates speaker line formatting, counts speaker occurrences, and extracts style
+        instructions if present. Falls back to default style instructions when none provided.
+
         Expected format:
-        {Style instructions} (optional)
-        Speaker 1: dialogue
-        Speaker 2: dialogue
-        ...
+            {Style instructions} (optional)
+            Speaker 1: dialogue
+            Speaker 2: dialogue
+            ...
+
+        Args:
+            text: The raw transcript text to validate and parse.
 
         Returns:
-        {
-            "valid": bool,
-            "error": str or None,
-            "warning": str or None,
-            "style": str,
-            "dialogues": [{"speaker": "1"|"2", "text": str}, ...],
-            "has_style": bool,
-            "speaker_1_count": int,
-            "speaker_2_count": int
-        }
+            dict: A dictionary containing validation results and parsed data:
+                {
+                    "valid": bool - Whether the transcript is valid
+                    "error": str | None - Error message if validation failed
+                    "warning": str | None - Warning message for non-critical issues
+                    "style": str - Style instructions (user-provided or default)
+                    "dialogues": list[dict] - Parsed speaker dialogues [{"speaker": "1"|"2", "text": str}, ...]
+                    "has_style": bool - Whether style instructions were found
+                    "speaker_1_count": int - Number of Speaker 1 lines
+                    "speaker_2_count": int - Number of Speaker 2 lines
+                }
         """
         result = {
             "valid": False,
@@ -342,20 +351,28 @@ class Action:
         result["dialogues"] = dialogues
         return result
 
-    #  TODO: rename to _generate_podcast
     async def _generate_podcast(
         self, transcript: str, user_id: str, podcast_name: str = "audio"
     ) -> list[str]:
         """
         Convert transcript to podcast audio using Gemini TTS API.
 
+        Streams audio generation from the Gemini API with multi-speaker voice configuration.
+        Automatically converts non-WAV formats to WAV. Saves transcript file only after
+        successful audio generation to prevent orphaned files. Supports chunked audio output
+        for longer podcasts.
+
         Args:
-            transcript: The formatted transcript text
-            user_id: User ID for file ownership
-            podcast_name: Name for the generated files
+            transcript: The formatted transcript text with speaker dialogues.
+            user_id: User ID for file ownership and access control.
+            podcast_name: Base name for the generated files (default: "audio").
 
         Returns:
-            List of file IDs (transcript file if enabled, plus audio file(s))
+            list[str]: List of file IDs in order - transcript file (if enabled) followed by
+                      audio file(s). Returns empty list if generation fails.
+
+        Raises:
+            Exception: Propagates any errors from Gemini API or file storage operations.
         """
         file_ids = []
 
@@ -459,14 +476,21 @@ class Action:
         return file_ids
 
     def _convert_to_wav(self, audio_data: bytes, mime_type: str) -> bytes:
-        """Generates a WAV file header for the given audio data and parameters.
+        """
+        Convert raw audio data to WAV format by generating a proper WAV file header.
+
+        Parses the MIME type to extract sample rate and bit depth, then constructs a
+        valid WAV/RIFF header according to the WAV specification. Defaults to 24000 Hz
+        sample rate and 16-bit PCM encoding if parameters cannot be extracted.
+
+        Format specification: http://soundfile.sapp.org/doc/WaveFormat/
 
         Args:
-            audio_data: The raw audio data as a bytes object.
-            mime_type: Mime type of the audio data.
+            audio_data: The raw audio data as a bytes object (PCM samples).
+            mime_type: MIME type of the audio data (e.g., "audio/L16;rate=24000").
 
         Returns:
-            A bytes object representing the WAV file header.
+            bytes: Complete WAV file (header + audio data) ready to be saved.
         """
         parameters = self._parse_audio_mime_type(mime_type)
         bits_per_sample = parameters["bits_per_sample"]
@@ -499,16 +523,25 @@ class Action:
         return header + audio_data
 
     def _parse_audio_mime_type(self, mime_type: str) -> dict[str, int | None]:
-        """Parses bits per sample and rate from an audio MIME type string.
+        """
+        Parse bits per sample and sample rate from an audio MIME type string.
 
-        Assumes bits per sample is encoded like "L16" and rate as "rate=xxxxx".
+        Extracts audio encoding parameters from MIME type strings. Assumes bits per sample
+        is encoded like "L16" (Linear 16-bit) and rate as "rate=xxxxx". Falls back to
+        safe defaults (16-bit, 24000 Hz) if parameters cannot be parsed.
 
         Args:
             mime_type: The audio MIME type string (e.g., "audio/L16;rate=24000").
 
         Returns:
-            A dictionary with "bits_per_sample" and "rate" keys. Values will be
-            integers if found, otherwise None.
+            dict[str, int | None]: Dictionary with "bits_per_sample" and "rate" keys.
+                                   Values are integers (default: 16 bits, 24000 Hz).
+
+        Examples:
+            >>> _parse_audio_mime_type("audio/L16;rate=24000")
+            {"bits_per_sample": 16, "rate": 24000}
+            >>> _parse_audio_mime_type("audio/L24;rate=48000")
+            {"bits_per_sample": 24, "rate": 48000}
         """
         bits_per_sample = 16
         rate = 24000
@@ -539,7 +572,29 @@ class Action:
         name: str,
         mime: str = "audio/wav",
     ) -> str:
-        """Saves file to File storage"""
+        """
+        Save file to Open WebUI storage and create database record with access control.
+
+        Handles both transcript (text/plain) and audio (audio/wav) files using Open WebUI's
+        storage factory pattern, which automatically routes to the configured backend
+        (local/S3/GCS/Azure). Creates database records with user-specific access control
+        and appropriate metadata tags.
+
+        Args:
+            file_bytes: The file content as bytes.
+            user_id: User ID for file ownership and access control.
+            name: Base name for the file (without extension).
+            mime: MIME type of the file - "text/plain" or "audio/wav" (default: "audio/wav").
+
+        Returns:
+            str: The unique file ID assigned to the saved file.
+
+        Note:
+            - Transcript files are named: "Podcast_Transcript_{name}.txt"
+            - Audio files are named: "Podcast_{name}.wav"
+            - Access is restricted to the creator (and admins)
+            - Files are tagged with user ID, file ID, and type for auditing
+        """
         # Generate unique ID (common for both text and audio)
         file_id = str(uuid.uuid4())
 
@@ -625,6 +680,35 @@ class Action:
         __request__=None,
         __id__=None
     ):
+        """
+        Main action handler for the Podcast It! plugin.
+
+        Orchestrates the complete podcast generation workflow:
+        1. Validates required parameters and API key
+        2. Extracts and validates transcript format
+        3. Generates podcast audio via Gemini TTS API
+        4. Saves files to storage with access control
+        5. Emits citations with embedded audio player
+
+        The action is triggered when users click the "Podcast It!" button in the UI.
+
+        Args:
+            body: Request body containing messages and metadata.
+            __user__: Current user object with id and permissions (required).
+            __event_emitter__: Function to emit events (status, notifications, citations) (required).
+            __event_call__: Event call identifier (required for actions).
+            __model__: Model identifier (unused).
+            __request__: FastAPI request object for base URL construction (optional).
+            __id__: Action invocation ID (unused).
+
+        Returns:
+            None: Actions always return None. Results are communicated via event emissions.
+
+        Event Types Emitted:
+            - "status": Progress updates during generation
+            - "notification": User-facing messages (errors, warnings, success)
+            - "citation": Generated files with embedded players or download links
+        """
         # fmt:on
         if not __user__:
             return None
@@ -638,7 +722,6 @@ class Action:
         # check if api key was provided or not
         if self.valves.API_KEY == DEFAULT_GEMINI_API_KEY_PLACEHOLDER:
             err_msg = f"Detected default placeholder API KEY: \"{DEFAULT_GEMINI_API_KEY_PLACEHOLDER}\", please update with your real Gemini API Key"
-            print(err_msg)
             await __event_emitter__({
                 "type": "notification",
                 "data": {"type": "error", "content": err_msg}
@@ -705,6 +788,11 @@ class Action:
             "type": "status",
             "data": {"description": "Generating Podcast..."}
         })
+        await __event_emitter__({
+            "type": "notification",
+            "data": {"type": "info", "content": "Podcast generation started. Sit tight, this might take awhile..."}
+        })
+
         try:
             file_ids = await self._generate_podcast(transcript=transcript, user_id=__user__["id"] )
             # Success notification
