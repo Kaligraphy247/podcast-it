@@ -231,7 +231,7 @@ Created by [@kaligraphy247](https://github.com/kaligraphy247)
 ## Acknowledgments
 
 - Built for [Open WebUI](https://github.com/open-webui/open-webui)
-- Powered by [Google Gemini TTS API](https://ai.google.dev/) with [Docs](https://docs.cloud.google.com/text-to-speech/docs/gemini-tts)
+- Powered by [Google Gemini TTS API](https://ai.google.dev/) with [Docs](https://docs.cloud.google.com/text-to-speech/docs/gemini-tts), [Docs](https://googleapis.github.io/python-genai/)
 
 ## Changelog
 

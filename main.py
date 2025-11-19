@@ -14,10 +14,14 @@ description:
 """
 # requirements: google-genai
 
+import asyncio
+import concurrent.futures
 import io
+import logging
 import mimetypes
 import re
 import struct
+import time
 import uuid
 
 # from typing import Any, Optional
@@ -27,6 +31,8 @@ from pydantic import BaseModel, Field
 
 from open_webui.models.files import FileForm, Files
 from open_webui.storage.provider import Storage
+
+log = logging.getLogger(__name__)
 
 LANGUAGES = {
     "Arabic (Egypt)": "ar-EG",
@@ -247,6 +253,9 @@ class Action:
                     "speaker_2_count": int - Number of Speaker 2 lines
                 }
         """
+        log.debug("Starting transcript validation")
+        log.debug(f"Transcript length: {len(text) if text else 0} characters")
+
         result = {
             "valid": False,
             "error": None,
@@ -260,6 +269,7 @@ class Action:
 
         # Check for empty input
         if not text or not text.strip():
+            log.warning("Transcript is empty")
             result["error"] = "Transcript is empty"
             return result
 
@@ -349,10 +359,20 @@ class Action:
         # and the success
         result["valid"] = True
         result["dialogues"] = dialogues
+
+        log.info(
+            f"Transcript validation successful - Speaker 1: {speaker_1_count} lines, Speaker 2: {speaker_2_count} lines, Total dialogues: {len(dialogues)}"
+        )
+        log.debug(f"Has custom style: {result['has_style']}")
+
         return result
 
     async def _generate_podcast(
-        self, transcript: str, user_id: str, podcast_name: str = "audio"
+        self,
+        transcript: str,
+        user_id: str,
+        podcast_name: str = "audio",
+        __event_emitter__=None,
     ) -> list[str]:
         """
         Convert transcript to podcast audio using Gemini TTS API.
@@ -366,6 +386,7 @@ class Action:
             transcript: The formatted transcript text with speaker dialogues.
             user_id: User ID for file ownership and access control.
             podcast_name: Base name for the generated files (default: "audio").
+            __event_emitter__: Optional event emitter for keep-alive status updates.
 
         Returns:
             list[str]: List of file IDs in order - transcript file (if enabled) followed by
@@ -374,9 +395,18 @@ class Action:
         Raises:
             Exception: Propagates any errors from Gemini API or file storage operations.
         """
+        log.info(
+            f"Starting podcast generation for user_id: {user_id}, podcast_name: {podcast_name}"
+        )
+        log.debug(f"Transcript length: {len(transcript)} characters")
+        log.debug(f"TTS Model: {self.valves.tts_model}")
+        log.debug(f"Speakers: {self.valves.speaker_1} & {self.valves.speaker_2}")
+        log.debug(f"Language: {self.valves.podcast_output_language}")
+
         file_ids = []
 
         # Generate audio first (don't save transcript until we know audio generation succeeds)
+        log.debug("Initializing Gemini client")
         client = genai.Client(api_key=self.valves.API_KEY)
 
         # Prepare content
@@ -414,54 +444,146 @@ class Action:
         )
 
         # Stream and save audio chunks
+        log.debug("Starting to stream audio chunks from Gemini API")
+
+        # Create a flag to stop the keep-alive task when generation completes
+        generation_complete = asyncio.Event()
+        generation_start_time = time.time()
         file_index = 0
-        for chunk in client.models.generate_content_stream(
-            model=self.valves.tts_model,
-            contents=contents,  # type: ignore
-            config=generate_content_config,
-        ):
-            if (
-                chunk.candidates is None
-                or chunk.candidates[0].content is None
-                or chunk.candidates[0].content.parts is None
-            ):
-                continue
 
-            if (
-                chunk.candidates[0].content.parts[0].inline_data
-                and chunk.candidates[0].content.parts[0].inline_data.data
-            ):
-                inline_data = chunk.candidates[0].content.parts[0].inline_data
-                data_buffer = inline_data.data
-                file_extension = mimetypes.guess_extension(inline_data.mime_type)  # type: ignore
+        # Background task to send periodic keep-alive messages
+        async def send_keepalive():
+            keepalive_interval = 10  # Send every 10 seconds
+            while not generation_complete.is_set():
+                await asyncio.sleep(keepalive_interval)
+                if not generation_complete.is_set():
+                    elapsed_seconds = int(time.time() - generation_start_time)
+                    if __event_emitter__:
+                        try:
+                            await __event_emitter__(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "description": f"Generating podcast audio... elapsed time: {elapsed_seconds}s",
+                                        "done": False,
+                                    },
+                                }
+                            )
+                            log.info(f"Keep-alive sent at {elapsed_seconds}s")
+                        except Exception as e:
+                            log.error(f"Keep-alive failed: {e}")
 
-                # Convert to WAV if needed
-                if file_extension is None:
-                    file_extension = ".wav"
-                    data_buffer = self._convert_to_wav(
-                        inline_data.data,  # type: ignore
-                        inline_data.mime_type,  # type: ignore
+        # Start the keep-alive task in background
+        keepalive_task = (
+            asyncio.create_task(send_keepalive()) if __event_emitter__ else None
+        )
+        if keepalive_task:
+            log.info("Keep-alive background task started")
+        else:
+            log.warning("Keep-alive task NOT started - no event emitter")
+
+        # Helper function to run the blocking Gemini API call
+        def _run_gemini_generation():
+            """Run the blocking Gemini API call in a thread pool"""
+            chunks = []
+            for chunk in client.models.generate_content_stream(
+                model=self.valves.tts_model,
+                contents=contents,  # type: ignore
+                config=generate_content_config,
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        try:
+            # Run the blocking Gemini call in a thread pool to not block the event loop
+            # Note: client.aio has issues with chunk size and async iteration, so we use ThreadPoolExecutor
+            log.debug("Starting Gemini API call in thread pool")
+            loop = asyncio.get_event_loop()
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                chunks = await loop.run_in_executor(executor, _run_gemini_generation)
+
+            log.debug(f"Gemini API call completed, processing {len(chunks)} chunks")
+
+            # Process all chunks
+            for chunk in chunks:
+                if (
+                    chunk.candidates is None
+                    or chunk.candidates[0].content is None
+                    or chunk.candidates[0].content.parts is None
+                ):
+                    log.debug("Skipping chunk with no content")
+                    continue
+
+                if (
+                    chunk.candidates[0].content.parts[0].inline_data
+                    and chunk.candidates[0].content.parts[0].inline_data.data
+                ):
+                    inline_data = chunk.candidates[0].content.parts[0].inline_data
+                    data_buffer = inline_data.data
+                    file_extension = mimetypes.guess_extension(inline_data.mime_type)  # type: ignore
+
+                    log.debug(
+                        f"Processing audio chunk {file_index}, MIME type: {inline_data.mime_type}, data size: {len(data_buffer)} bytes"  # type: ignore
                     )
 
-                # Save audio file with index if multiple chunks
-                chunk_name = (
-                    f"{podcast_name}_{file_index}" if file_index > 0 else podcast_name
-                )
-                audio_file_id = self._save_file(
-                    file_bytes=data_buffer,  # type: ignore
-                    user_id=user_id,
-                    name=chunk_name,
-                    mime="audio/wav",
-                )
-                file_ids.append(audio_file_id)
-                file_index += 1
+                    # Convert to WAV if needed
+                    if file_extension is None:
+                        log.debug(f"Converting chunk {file_index} to WAV format")
+                        file_extension = ".wav"
+                        data_buffer = self._convert_to_wav(
+                            inline_data.data,  # type: ignore
+                            inline_data.mime_type,  # type: ignore
+                        )
 
-            else:
-                # Text response (shouldn't happen with audio modality)
-                print(f"Unexpected text chunk: {chunk.text}")
+                    # Save audio file with index if multiple chunks
+                    chunk_name = (
+                        f"{podcast_name}_{file_index}"
+                        if file_index > 0
+                        else podcast_name
+                    )
+                    audio_file_id = self._save_file(
+                        file_bytes=data_buffer,  # type: ignore
+                        user_id=user_id,
+                        name=chunk_name,
+                        mime="audio/wav",
+                    )
+                    log.info(
+                        f"Audio chunk {file_index} saved - file_id: {audio_file_id}"
+                    )
+                    file_ids.append(audio_file_id)
+                    file_index += 1
+
+                else:
+                    # Text response (shouldn't happen with audio modality)
+                    log.warning(f"Unexpected text chunk received: {chunk.text}")
+
+        finally:
+            # Signal keep-alive task to stop
+            generation_complete.set()
+            if keepalive_task:
+                await keepalive_task
+                log.debug("Keep-alive background task stopped")
+
+            # Send final elapsed time status
+            final_elapsed_seconds = int(time.time() - generation_start_time)
+            if __event_emitter__ and final_elapsed_seconds > 0:
+                try:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"Audio generation completed in {final_elapsed_seconds}s",
+                                "done": True,
+                            },
+                        }
+                    )
+                    log.info(f"Final elapsed time sent: {final_elapsed_seconds}s")
+                except Exception as e:
+                    log.error(f"Failed to send final elapsed time: {e}")
 
         # Optionally save transcript after successful audio generation, if enabled
         if self.valves.save_transcript == "Yes" and len(file_ids) > 0:
+            log.debug("Saving transcript (enabled in valves)")
             transcript_bytes = transcript.encode("utf-8")
             transcript_file_id = self._save_file(
                 file_bytes=transcript_bytes,
@@ -469,9 +591,15 @@ class Action:
                 name=podcast_name,
                 mime="text/plain",
             )
+            log.info(f"Transcript saved with file_id: {transcript_file_id}")
             file_ids.insert(
                 0, transcript_file_id
             )  # Insert at beginning so transcript is first
+        elif self.valves.save_transcript == "Yes":
+            log.warning("Transcript saving enabled but no audio files were generated")
+
+        log.info(f"Podcast generation complete. Total files generated: {len(file_ids)}")
+        log.debug(f"File IDs: {file_ids}")
 
         return file_ids
 
@@ -597,6 +725,9 @@ class Action:
         """
         # Generate unique ID (common for both text and audio)
         file_id = str(uuid.uuid4())
+        log.debug(
+            f"Saving file - name: {name}, mime: {mime}, size: {len(file_bytes)} bytes, user_id: {user_id}, file_id: {file_id}"
+        )
 
         if mime == "text/plain":
             # Save transcript as text file
@@ -631,6 +762,7 @@ class Action:
             )
 
             file_item = Files.insert_new_file(user_id=user_id, form_data=file_form)
+            log.info(f"Transcript saved - file_id: {file_item.id}")  # type: ignore
             return file_item.id  # type: ignore
 
         else:
@@ -667,6 +799,9 @@ class Action:
             )
 
             file_item = Files.insert_new_file(user_id=user_id, form_data=file_form)
+            log.info(
+                f"Audio saved - file_id: {file_item.id}, size: {len(file_bytes)} bytes"  # type: ignore
+            )
             return file_item.id  # type: ignore
 
     # fmt:off
@@ -710,17 +845,27 @@ class Action:
             - "citation": Generated files with embedded players or download links
         """
         # fmt:on
+        log.info("Podcast It! action triggered")
+        log.debug(f"__user__ present: {__user__ is not None}, user_id: {__user__.get('id') if __user__ else 'None'}")
+        log.debug(f"__event_emitter__ present: {__event_emitter__ is not None}")
+        log.debug(f"__event_call__ present: {__event_call__ is not None}")
+        log.debug(f"__request__ present: {__request__ is not None}")
+
         if not __user__:
+            log.error("Missing __user__ parameter, cannot proceed")
             return None
 
         if not __event_call__:
+            log.error("Missing __event_call__ parameter, cannot proceed")
             return None
 
         if not __event_emitter__:
+            log.error("Missing __event_emitter__ parameter, cannot proceed")
             return None
 
         # check if api key was provided or not
         if self.valves.API_KEY == DEFAULT_GEMINI_API_KEY_PLACEHOLDER:
+            log.error("API key is still the default placeholder")
             err_msg = f"Detected default placeholder API KEY: \"{DEFAULT_GEMINI_API_KEY_PLACEHOLDER}\", please update with your real Gemini API Key"
             await __event_emitter__({
                 "type": "notification",
@@ -728,8 +873,10 @@ class Action:
             })
             return None
 
+        log.debug("Extracting messages from body")
         messages: list[dict] = body.get("messages", [])
         if not messages:
+            log.error("No messages found in conversation body")
             await __event_emitter__({
                 "type": "notification",
                 "data": {
@@ -740,12 +887,15 @@ class Action:
             return None
 
         transcript = messages[-1]["content"]
+        log.debug(f"Extracted transcript from last message, length: {len(transcript)} characters")
 
         # validate & parse
+        log.debug("Validating transcript format")
         result = self._validate_transcript_format(text=transcript)
 
         # Handle errors
         if not result["valid"]:
+            log.warning(f"Transcript validation failed: {result['error']}")
             await __event_emitter__({
                 "type": "notification",
                 "data": {
@@ -759,8 +909,11 @@ class Action:
             })
             return None
 
+        log.info("Transcript validated successfully")
+
         # Handle warning and continue...
         if result["warning"]:
+            log.debug(f"Validation warning: {result['warning']}")
             await __event_emitter__({
                 "type": "notification",
                 "data": {
@@ -773,7 +926,7 @@ class Action:
         await __event_emitter__({
             "type": "status",
             "data": {
-                "description": f"Transcript validated: Speaker 1 has: {result['speaker_1_count']} {'line' if result['speaker_1_count'] == 1 else 'lines'}, "
+                "description": f"Transcript validated - Speaker 1 has: {result['speaker_1_count']} {'line' if result['speaker_1_count'] == 1 else 'lines'}, "
             }
         })
         await __event_emitter__({
@@ -790,23 +943,28 @@ class Action:
         })
         await __event_emitter__({
             "type": "notification",
-            "data": {"type": "info", "content": "Podcast generation started. Sit tight, this might take awhile..."}
+            "data": {"type": "info", "content": "Podcast generation started. Sit tight - this might take awhile..."}
         })
 
         try:
-            file_ids = await self._generate_podcast(transcript=transcript, user_id=__user__["id"] )
-            # Success notification
-            await __event_emitter__({
-                "type": "status",
-                "data": {"description": "Podcast generation complete!"}
-            })
+            log.info("Starting podcast generation")
+            file_ids = await self._generate_podcast(
+                transcript=transcript,
+                user_id=__user__["id"],
+                __event_emitter__=__event_emitter__
+            )
+            log.info(f"Podcast generation returned {len(file_ids)} file IDs: {file_ids}")
+
+            # Success notification (status already marked done in _generate_podcast)
             await __event_emitter__({
                 "type": "notification",
                 "data": {"type": "info", "content": "Podcast generation complete!"}
             })
 
             # Emit citations with links to generated files
-            for file_id in file_ids:
+            log.info(f"Emitting citations for {len(file_ids)} files")
+
+            for idx, file_id in enumerate(file_ids):
                 file = Files.get_file_by_id(file_id)
                 if file and file.meta:
                     # Construct base URL
@@ -814,6 +972,7 @@ class Action:
                         base_url = f"{__request__.url.scheme}://{__request__.url.netloc}"
                     else:
                         base_url = ""
+                        log.warning("No __request__ available, base URL will be empty")
 
                     # Content download endpoint
                     file_content_url = f"{base_url}/api/v1/files/{file_id}/content"
@@ -839,19 +998,26 @@ class Action:
                         document_content = file_content_url
                         metadata = {"source": file.meta.get("name", file.filename)}
 
-                    await __event_emitter__({
+                    citation_event = {
                         "type": "citation",
                         "data": {
                             "source": {"name": source_name},
                             "document": [document_content],
                             "metadata": [metadata],
                         }
-                    })
+                    }
+
+                    await __event_emitter__(citation_event)
+                    log.info(f"Citation emitted - {source_name}, file_id: {file_id}")
+                else:
+                    log.error(f"Failed to retrieve file from database or file has no meta - file_id: {file_id}, file exists: {file is not None}")
 
             # Success
+            log.info(f"Podcast action completed successfully, {len(file_ids)} citations emitted")
             return None
 
         except Exception as e:
+            log.error(f"Podcast generation failed with exception: {type(e).__name__}: {str(e)}", exc_info=True)
             await __event_emitter__({
                 "type": "status",
                 "data": {"description": f"Podcast generation failed with error: {str(e)[:47]}..."}
